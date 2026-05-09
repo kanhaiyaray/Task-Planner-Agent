@@ -1,30 +1,54 @@
 import "dotenv/config";
 import express from "express";
-import cors    from "cors";
-import fetch   from "node-fetch";
-import path    from "path";
+import cors from "cors";
+import fetch from "node-fetch";
+import path from "path";
 import { fileURLToPath } from "url";
 
-const __dirname      = path.dirname(fileURLToPath(import.meta.url));
-const app            = express();
-const DEFAULT_PORT   = process.env.PORT || 3001;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const DEFAULT_PORT = process.env.PORT || 3001;
 
 // ── CORS with multi‑origin support ─────────────────────────────────
-const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+const configured = (process.env.CORS_ORIGIN || 'http://localhost:5173')
   .split(',')
-  .map(origin => origin.trim());
+  .map(origin => origin.trim())
+  .filter(Boolean);
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS blocked: ${origin} not allowed`));
-    }
-  },
-  credentials: true,
-}));
+// Add common deploy-provided URLs if present (Render, Vercel, etc.)
+const extraOrigins = [process.env.RENDER_EXTERNAL_URL, process.env.DEPLOYMENT_URL, process.env.URL]
+  .filter(Boolean);
+
+const allowedOrigins = Array.from(new Set([...configured, ...extraOrigins]));
+
+// Dynamic CORS: use a per-request cors wrapper so we can compare the request
+// `Host` header with the `Origin` header when deciding whether to allow it.
+app.use((req, res, next) => {
+  const options = {
+    origin: function (originHeader, callback) {
+      if (!originHeader) return callback(null, true);
+
+      if (allowedOrigins.includes(originHeader)) {
+        return callback(null, true);
+      }
+
+      try {
+        const originHost = new URL(originHeader).host;
+        const reqHost = req.headers && req.headers.host;
+        if (originHost && reqHost && originHost === reqHost) {
+          return callback(null, true);
+        }
+      } catch (e) {
+        // ignore parse errors
+      }
+
+      return callback(new Error(`CORS blocked: ${originHeader} not allowed`));
+    },
+    credentials: true,
+  };
+
+  return cors(options)(req, res, next);
+});
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -35,10 +59,10 @@ const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 app.get("/api/health", (_req, res) => {
   const hasKey = !!process.env.GROQ_API_KEY;
   res.status(hasKey ? 200 : 503).json({
-    ok:     hasKey,
+    ok: hasKey,
     server: "task-planner-agent",
-    model:  "llama-3.3-70b-versatile",
-    error:  hasKey ? null : "GROQ_API_KEY is not set in your .env file",
+    model: "llama-3.3-70b-versatile",
+    error: hasKey ? null : "GROQ_API_KEY is not set in your .env file",
   });
 });
 
@@ -70,7 +94,7 @@ app.post("/api/messages", async (req, res) => {
     const upstream = await fetch(GROQ_API_URL, {
       method: "POST",
       headers: {
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
         "Authorization": `Bearer ${apiKey}`,
       },
       body: JSON.stringify(req.body),
@@ -89,9 +113,9 @@ app.post("/api/messages", async (req, res) => {
       const groqMsg = data?.error?.message || data?.error || JSON.stringify(data);
       console.error(`[groq ${upstream.status}]`, groqMsg);
       return res.status(upstream.status).json({
-        error:            groqMsg,
+        error: groqMsg,
         _upstream_status: upstream.status,
-        _upstream_body:   data,
+        _upstream_body: data,
       });
     }
 
@@ -105,9 +129,17 @@ app.post("/api/messages", async (req, res) => {
 // ── Production static serving ─────────────────────────────────────────────────
 if (process.env.NODE_ENV === "production") {
   app.use(express.static(path.join(__dirname, "dist")));
-  app.get("*", (_req, res) =>
-    res.sendFile(path.join(__dirname, "dist", "index.html"))
-  );
+
+  // Only send `index.html` for navigation requests (no file extension).
+  // This prevents static asset requests (e.g. *.css, *.js) from receiving
+  // HTML when the asset is missing — which leads to MIME type errors.
+  app.get("*", (req, res) => {
+    const ext = path.extname(req.path);
+    if (!ext) {
+      return res.sendFile(path.join(__dirname, "dist", "index.html"));
+    }
+    return res.status(404).end();
+  });
 }
 
 // ── Auto port fallback (tries next ports if busy) ────────────────────────────
